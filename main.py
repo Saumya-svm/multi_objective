@@ -50,6 +50,9 @@ from botorch.utils.sampling import sample_simplex
 import argparse
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
+from random import shuffle
+
+
 
 
 def parse(file):
@@ -62,19 +65,9 @@ def parse(file):
     x = x.astype('float32')
     return x
 
-target = []
-for file in os.listdir('tcnn_data'):
-  if file[0] == 'f' and file[-1] == 't':
-    target.append(parse(file))
-  # target.append(extract_features(f'tcnn_images/{file}'))
-target = np.array(target)
-
-from random import shuffle
-image_1d = target.reshape(-1,192)
-
 # prepare input and target arrays
 
-def prepare_data(seq_len):
+def prepare_data(target, image_1d, seq_len):
   X = []
   y = []
 
@@ -100,7 +93,6 @@ def prepare_data(seq_len):
   testX, testY = X[val_size:], y[val_size:]
   return trainX, trainY, valX, valY, testX, testY
 
-trainX, trainY, valX, valY, testX, testY = prepare_data(16)
 
 class CausalConv1d(nn.Conv1d):
     def __init__(self, in_channels, out_channels, kernel_size,
@@ -214,9 +206,6 @@ class ResBlock(nn.Module):
 
 #         return x
 
-res = ResBlock(input=True)
-res.layers, res(torch.tensor(trainX[:2].reshape(-1, 192, 16))).shape
-
 class TCNN(nn.Module):
     def __init__(self, num_blocks=3, num_layers=3, dilations=None, dropout_prob=0.25, filters=64, padding='causal'):
         super().__init__()
@@ -257,8 +246,6 @@ class TCNN(nn.Module):
         return output
 
 sample = TCNN(num_blocks=5, filters=6, num_layers=4, dilations=[1,2,4,8])
-output = sample(torch.tensor(trainX.reshape(-1, 192, 16)))
-output.shape
 
 ### setup our problem for TCNN
 ### minimise the number of params and the error for the prediction
@@ -389,45 +376,6 @@ problem = TCNNProblem()
 X = torch.tensor([[3, 4, 3, 0.001, 0.8, 50]])
 # problem(X)
 
-from botorch.utils.sampling import draw_sobol_samples
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-def generate_initial_data(n=6):
-    # generate training data
-    train_x = draw_sobol_samples(bounds=problem.bounds, n=n, q=1).squeeze(1).to(device)
-    print(train_x)
-    train_obj_true = problem(train_x).to(device)
-    train_obj = train_obj_true + torch.randn_like(train_obj_true) * 0*0
-    return train_x, train_obj, train_obj_true
-
-train_x, train_obj, train_obj_true = generate_initial_data(n=2 * (problem.dim + 1))
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-train_x = torch.load('drive/MyDrive/multi_objective/windpmf_train_x.pt', map_location=device)
-train_obj = torch.load('drive/MyDrive/multi_objective/windpmf_train_obj.pt', map_location=device).to(torch.float32)
-train_obj_true = torch.load('drive/MyDrive/multi_objective/windpmf_train_obj_true.pt', map_location=device).to(torch.float32)
-
-train_x_qnehvi, train_obj_qnehvi, train_obj_true_qnehvi = (train_x.to(torch.float32), train_obj.to(torch.float32), train_obj_true.to(torch.float32))
-
-
-
-SMOKE_TEST = os.environ.get("SMOKE_TEST")
-MC_SAMPLES = 128 if not SMOKE_TEST else 16
-
-tkwargs = {
-    "dtype": torch.float32,
-    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-}
-
-BATCH_SIZE = 2
-NUM_RESTARTS = 10 if not SMOKE_TEST else 2
-RAW_SAMPLES = 512 if not SMOKE_TEST else 4
-verbose = True
-
-standard_bounds = torch.zeros(2, problem.dim, **tkwargs)
-standard_bounds[1] = 1
 
 def optimize_qnehvi_and_get_observation(model, train_x, train_obj, sampler):
     """Optimizes the qEHVI acquisition function, and returns a new candidate and observation."""
@@ -474,59 +422,15 @@ def initialize_model(train_x, train_obj):
 
 # mll_qnehvi, model_qnehvi = initialize_model(train_x_qnehvi.to(device), train_obj_qnehvi.to(device))
 
-# compute hypervolume
-bd = DominatedPartitioning(ref_point=problem.ref_point.to(device), Y=train_obj_true.to(device)).to(device)
-volume = bd.compute_hypervolume().item()
+def generate_initial_data(n=6):
 
-hvs_qnehvi = []
-hvs_qnehvi.append(volume)
-print(hvs_qnehvi, type(hvs_qnehvi))
+    # generate training data
+    train_x = draw_sobol_samples(bounds=problem.bounds, n=n, q=1).squeeze(1).to(device)
+    print(train_x)
+    train_obj_true = problem(train_x).to(device)
+    train_obj = train_obj_true + torch.randn_like(train_obj_true) * 0*0
+    return train_x, train_obj, train_obj_true
 
-# run N_BATCH rounds of BayesOpt after the initial random batch
-N_BATCH = 3
-for iteration in range(1, N_BATCH + 1):
-
-    t0 = time.monotonic()
-
-    # fit the models
-    fit_gpytorch_mll(mll_qnehvi)
-
-    # define the qEI and qNEI acquisition modules using a QMC sampler
-    qnehvi_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([MC_SAMPLES])).to(torch.float32)
-
-    # optimize acquisition functions and get new observations
-    (
-        new_x_qnehvi,
-        new_obj_qnehvi,
-        new_obj_true_qnehvi,
-    ) = optimize_qnehvi_and_get_observation(
-        model_qnehvi, train_x_qnehvi.to(torch.float32), train_obj_qnehvi.to(torch.float32), qnehvi_sampler.to(torch.float32)
-    )
-    # update training points
-    train_x_qnehvi = torch.cat([train_x_qnehvi.to(device), new_x_qnehvi])
-    train_obj_qnehvi = torch.cat([train_obj_qnehvi, new_obj_qnehvi])
-    train_obj_true_qnehvi = torch.cat([train_obj_true_qnehvi, new_obj_true_qnehvi])
-
-    bd = DominatedPartitioning(ref_point=problem.ref_point.to(device), Y=train_obj_true_qnehvi.to(device)).to(device)
-    volume = bd.compute_hypervolume().item()
-    hvs_qnehvi.append(volume)
-
-    # reinitialize the models so they are ready for fitting on next iteration
-    # Note: we find improved performance from not warm starting the model hyperparameters
-    # using the hyperparameters from the previous iteration
-    mll_qnehvi, model_qnehvi = initialize_model(train_x_qnehvi, train_obj_true_qnehvi)
-
-    t1 = time.monotonic()
-
-    if verbose:
-        print(
-            f"\nBatch {iteration:>2}: Hypervolume (NEHVI) = "
-            f"(8{hvs_qnehvi[-1]:>4.2f}), "
-            f"time = {t1-t0:>4.2f}.",
-            end="",
-        )
-    else:
-        print(".", end="")
 
 def plot():
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -561,6 +465,104 @@ def plot():
     plt.show()
 
 
+SMOKE_TEST = os.environ.get("SMOKE_TEST")
+MC_SAMPLES = 128 if not SMOKE_TEST else 16
+
+tkwargs = {
+    "dtype": torch.float32,
+    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+}
+
+BATCH_SIZE = 2
+NUM_RESTARTS = 10 if not SMOKE_TEST else 2
+RAW_SAMPLES = 512 if not SMOKE_TEST else 4
+verbose = True
+
+standard_bounds = torch.zeros(2, problem.dim, **tkwargs)
+standard_bounds[1] = 1
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+train_x, train_obj, train_obj_true = generate_initial_data(n=2 * (problem.dim + 1))
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+train_x = torch.load('drive/MyDrive/multi_objective/windpmf_train_x.pt', map_location=device)
+train_obj = torch.load('drive/MyDrive/multi_objective/windpmf_train_obj.pt', map_location=device).to(torch.float32)
+train_obj_true = torch.load('drive/MyDrive/multi_objective/windpmf_train_obj_true.pt', map_location=device).to(torch.float32)
+
+train_x_qnehvi, train_obj_qnehvi, train_obj_true_qnehvi = (train_x.to(torch.float32), train_obj.to(torch.float32), train_obj_true.to(torch.float32))
+
+
+
+def main():
+    target = []
+    for file in os.listdir('tcnn_data'):
+        if file[0] == 'f' and file[-1] == 't':
+            target.append(parse(file))
+        # target.append(extract_features(f'tcnn_images/{file}'))
+    target = np.array(target)
+
+    image_1d = target.reshape(-1,192)
+
+    trainX, trainY, valX, valY, testX, testY = prepare_data(target, image_1d, 16)
+
+    bd = DominatedPartitioning(ref_point=problem.ref_point.to(device), Y=train_obj_true.to(device)).to(device)
+    volume = bd.compute_hypervolume().item()
+
+    hvs_qnehvi = []
+    hvs_qnehvi.append(volume)
+    print(hvs_qnehvi, type(hvs_qnehvi))
+
+    # run N_BATCH rounds of BayesOpt after the initial random batch
+    N_BATCH = 3
+    for iteration in range(1, N_BATCH + 1):
+
+        t0 = time.monotonic()
+
+        # fit the models
+        fit_gpytorch_mll(mll_qnehvi)
+
+        # define the qEI and qNEI acquisition modules using a QMC sampler
+        qnehvi_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([MC_SAMPLES])).to(torch.float32)
+
+        # optimize acquisition functions and get new observations
+        (
+            new_x_qnehvi,
+            new_obj_qnehvi,
+            new_obj_true_qnehvi,
+        ) = optimize_qnehvi_and_get_observation(
+            model_qnehvi, train_x_qnehvi.to(torch.float32), train_obj_qnehvi.to(torch.float32), qnehvi_sampler.to(torch.float32)
+        )
+        # update training points
+        train_x_qnehvi = torch.cat([train_x_qnehvi.to(device), new_x_qnehvi])
+        train_obj_qnehvi = torch.cat([train_obj_qnehvi, new_obj_qnehvi])
+        train_obj_true_qnehvi = torch.cat([train_obj_true_qnehvi, new_obj_true_qnehvi])
+
+        bd = DominatedPartitioning(ref_point=problem.ref_point.to(device), Y=train_obj_true_qnehvi.to(device)).to(device)
+        volume = bd.compute_hypervolume().item()
+        hvs_qnehvi.append(volume)
+
+        # reinitialize the models so they are ready for fitting on next iteration
+        # Note: we find improved performance from not warm starting the model hyperparameters
+        # using the hyperparameters from the previous iteration
+        mll_qnehvi, model_qnehvi = initialize_model(train_x_qnehvi, train_obj_true_qnehvi)
+
+        t1 = time.monotonic()
+
+        if verbose:
+            print(
+                f"\nBatch {iteration:>2}: Hypervolume (NEHVI) = "
+                f"(8{hvs_qnehvi[-1]:>4.2f}), "
+                f"time = {t1-t0:>4.2f}.",
+                end="",
+            )
+        else:
+            print(".", end="")
+
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-objective optimization for image classification")
 
@@ -579,3 +581,5 @@ if __name__ == "__main__":
     # Run your main optimization loop here, using the parsed arguments
     # For example:
     # run_optimization(num_iterations=num_iterations, batch_size=batch_size, verbose=verbose, output_file=output_file)
+
+    
